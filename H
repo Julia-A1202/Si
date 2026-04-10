@@ -1,0 +1,219 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity top is
+    Port (
+        clk_i     : in  std_logic;
+        RXD_i     : in  std_logic;
+        TXD_o     : out std_logic;
+        ld0       : out std_logic;
+        led7_an_o : out std_logic_vector(3 downto 0);
+        led7_seg_o: out std_logic_vector(7 downto 0)
+    );
+end top;
+
+architecture Behavioral of top is
+
+-- ================= UART =================
+signal rx_data      : std_logic_vector(7 downto 0);
+signal rx_valid     : std_logic;
+
+signal tx_data      : std_logic_vector(7 downto 0);
+signal tx_start     : std_logic;
+signal tx_busy      : std_logic;
+
+-- ================= FIFO =================
+signal fifo_dout : std_logic_vector(7 downto 0);
+signal fifo_full : std_logic;
+signal fifo_empty: std_logic;
+signal fifo_wr   : std_logic;
+signal fifo_rd   : std_logic;
+
+-- ================= ROM =================
+signal rom_addr : std_logic_vector(11 downto 0);
+signal rom_data : std_logic_vector(7 downto 0);
+
+-- ================= BUFOR =================
+type buffer_t is array (0 to 17) of std_logic_vector(7 downto 0);
+signal buffer : buffer_t;
+signal buf_count : integer range 0 to 18 := 0;
+
+-- ================= FSM =================
+type state_t is (
+    IDLE, COLLECT, LOAD_BUF,
+    PRINT_ROW, PRINT_COL, PRINT_BIT,
+    SEND_CR, SEND_LF
+);
+
+signal state : state_t := IDLE;
+
+-- ================= ITERATORY =================
+signal row : integer range 0 to 15 := 0;
+signal col : integer range 0 to 17 := 0;
+signal bit_idx : integer range 0 to 7 := 0;
+
+signal current_char : std_logic_vector(7 downto 0);
+signal pixel_char   : std_logic_vector(7 downto 0);
+
+begin
+
+-- ================= UART INST =================
+uart_rx_inst: entity work.uart_rx
+port map (
+    clk => clk_i,
+    rx  => RXD_i,
+    data => rx_data,
+    valid => rx_valid
+);
+
+uart_tx_inst: entity work.uart_tx
+port map (
+    clk => clk_i,
+    data => tx_data,
+    start => tx_start,
+    tx => TXD_o,
+    busy => tx_busy
+);
+
+-- ================= FIFO =================
+fifo_inst: entity work.fifo_mem
+port map (
+    clk   => clk_i,
+    din   => rx_data,
+    wr_en => fifo_wr,
+    rd_en => fifo_rd,
+    dout  => fifo_dout,
+    full  => fifo_full,
+    empty => fifo_empty
+);
+
+-- ================= ROM =================
+rom_inst: entity work.char_mem
+port map (
+    clka  => clk_i,
+    addra => rom_addr,
+    douta => rom_data
+);
+
+-- ================= LOGIKA =================
+
+process(clk_i)
+begin
+if rising_edge(clk_i) then
+
+    tx_start <= '0';
+    fifo_wr <= '0';
+    fifo_rd <= '0';
+
+    -- overflow LED
+    if fifo_full = '1' then
+        ld0 <= '1';
+    else
+        ld0 <= '0';
+    end if;
+
+    case state is
+
+    -- ================= ODBIÓR =================
+    when IDLE =>
+        if rx_valid = '1' then
+            fifo_wr <= '1';
+            state <= COLLECT;
+        end if;
+
+    when COLLECT =>
+        if rx_valid = '1' and fifo_full = '0' then
+            fifo_wr <= '1';
+        end if;
+
+        if (buf_count = 18) or (rx_data = x"0D") then
+            state <= LOAD_BUF;
+            buf_count <= 0;
+        end if;
+
+    -- ================= ZAŁADUJ DO BUFFERA =================
+    when LOAD_BUF =>
+        if fifo_empty = '0' then
+            fifo_rd <= '1';
+            buffer(buf_count) <= fifo_dout;
+            buf_count <= buf_count + 1;
+
+            if buf_count = 17 then
+                row <= 0;
+                col <= 0;
+                state <= PRINT_ROW;
+            end if;
+        end if;
+
+    -- ================= DRUKOWANIE =================
+    when PRINT_ROW =>
+        col <= 0;
+        state <= PRINT_COL;
+
+    when PRINT_COL =>
+        current_char <= buffer(col);
+
+        if (unsigned(current_char) < 32) or (unsigned(current_char) > 127) then
+            pixel_char <= x"2A"; -- '*'
+        else
+            pixel_char <= current_char;
+        end if;
+
+        rom_addr <= current_char & std_logic_vector(to_unsigned(row,4));
+        bit_idx <= 7;
+        state <= PRINT_BIT;
+
+    when PRINT_BIT =>
+        if tx_busy = '0' then
+            if rom_data(bit_idx) = '1' then
+                tx_data <= pixel_char;
+            else
+                tx_data <= x"20"; -- spacja
+            end if;
+            tx_start <= '1';
+
+            if bit_idx = 0 then
+                if col = 17 then
+                    state <= SEND_CR;
+                else
+                    col <= col + 1;
+                    state <= PRINT_COL;
+                end if;
+            else
+                bit_idx <= bit_idx - 1;
+            end if;
+        end if;
+
+    when SEND_CR =>
+        if tx_busy = '0' then
+            tx_data <= x"0D";
+            tx_start <= '1';
+            state <= SEND_LF;
+        end if;
+
+    when SEND_LF =>
+        if tx_busy = '0' then
+            tx_data <= x"0A";
+            tx_start <= '1';
+
+            if row = 15 then
+                state <= IDLE;
+            else
+                row <= row + 1;
+                state <= PRINT_ROW;
+            end if;
+        end if;
+
+    when others =>
+        state <= IDLE;
+
+    end case;
+end if;
+end process;
+
+-- ================= 7-seg =================
+led7_an_o <= "1110";
+led7_seg_o <= "11111111";
+
+end Behavioral;
